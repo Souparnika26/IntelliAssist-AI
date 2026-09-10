@@ -21,11 +21,11 @@ class RagEngine:
     """Core Retrieval-Augmented Generation engine aligned with app.py schema."""
 
     def __init__(
-        self,
-        vector_store: Any,
-        model_name: str = "gemini-3.6-flash",
-        guardrail_threshold: float = 60.0,
-        confidence_threshold: Optional[float] = None
+            self,
+            vector_store: Any,
+            model_name: str = "gemini-3.6-flash",
+            guardrail_threshold: float = 60.0,
+            confidence_threshold: Optional[float] = None
     ):
         self.vector_store = vector_store
         # Hardcode gemini-3.6-flash to guarantee deprecation bypass
@@ -33,24 +33,33 @@ class RagEngine:
         self.model_id = "gemini-3.6-flash"
         self.guardrail_threshold = confidence_threshold if confidence_threshold is not None else guardrail_threshold
 
-        api_key = os.environ.get("GEMINI_API_KEY", "").strip()
         self.client = None
-        if GENAI_AVAILABLE and api_key:
+        if GENAI_AVAILABLE:
             try:
-                if api_key.startswith("AQ."):
+                import streamlit as st
+                from google.oauth2 import service_account
+
+                if hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
+                    sa_info = dict(st.secrets["gcp_service_account"])
+                    credentials = service_account.Credentials.from_service_account_info(
+                        sa_info,
+                        scopes=["https://www.googleapis.com/auth/cloud-platform"]
+                    )
                     self.client = genai.Client(
-                        api_key=api_key,
-                        http_options={
-                            "headers": {
-                                "Authorization": f"Bearer {api_key}",
-                                "X-Goog-Api-Key": api_key,
-                            }
-                        },
+                        vertexai=True,
+                        project=sa_info["project_id"],
+                        location="us-central1",
+                        credentials=credentials
                     )
                 else:
+                    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
                     self.client = genai.Client(api_key=api_key)
             except Exception:
-                self.client = None
+                api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+                try:
+                    self.client = genai.Client(api_key=api_key)
+                except Exception:
+                    self.client = None
 
         # Explicit reference pronouns
         self.pronoun_pattern = re.compile(
