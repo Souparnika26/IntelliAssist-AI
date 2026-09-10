@@ -1,19 +1,17 @@
 """
 RAG Engine Module for IntelliAssist AI.
-Supports modern Google AI Studio AQ authorization keys via direct HTTP Bearer headers.
-Preserves context retrieval, guardrails, pronoun contextualization, and grounded generation.
+Manages context retrieval, calibrated guardrails, pronoun/elliptical query contextualization,
+and strictly grounded generation using Google Gemini.
 """
 
-import json
 import os
 import re
-import urllib.error
-import urllib.request
-from typing import Any, Dict, List, Optional
+from typing import List, Dict, Any, Optional
 
 try:
     from google import genai
     from google.genai import types
+    from google.genai.errors import APIError
     GENAI_AVAILABLE = True
 except ImportError:
     GENAI_AVAILABLE = False
@@ -30,27 +28,15 @@ class RagEngine:
         confidence_threshold: Optional[float] = None
     ):
         self.vector_store = vector_store
+        # Hardcode gemini-3.6-flash to guarantee deprecation bypass
         self.model_name = "gemini-3.6-flash"
-        self.model_id = "gemini-3.6-flash"
-        self.guardrail_threshold = (
-            confidence_threshold if confidence_threshold is not None else guardrail_threshold
-        )
+        self.guardrail_threshold = confidence_threshold if confidence_threshold is not None else guardrail_threshold
 
-        # 1. Retrieve API key from environment or Streamlit Secrets
-        self.api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-        if not self.api_key:
-            try:
-                import streamlit as st
-                if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
-                    self.api_key = str(st.secrets["GEMINI_API_KEY"]).strip()
-            except Exception:
-                pass
-
-        # 2. SDK client fallback for legacy AIza keys only
+        api_key = os.environ.get("GEMINI_API_KEY")
         self.client = None
-        if GENAI_AVAILABLE and self.api_key and not self.api_key.startswith("AQ."):
+        if GENAI_AVAILABLE and api_key:
             try:
-                self.client = genai.Client(api_key=self.api_key)
+                self.client = genai.Client(api_key=api_key)
             except Exception:
                 self.client = None
 
@@ -60,7 +46,7 @@ class RagEngine:
             re.IGNORECASE
         )
 
-        # Bare elliptical follow-up tokens
+        # Bare elliptical follow-up tokens (only when no distinct new topic is introduced)
         self.bare_followup_pattern = re.compile(
             r'^(give\s+(a\s+|an\s+)?(concrete\s+)?example|example|elaborate|clarify|explain\s+more|tell\s+me\s+more|more\s+details|why|why\s+so|how\s+so)\??$',
             re.IGNORECASE
@@ -80,6 +66,7 @@ class RagEngine:
         if not last_user_query:
             return None
 
+        # Strip standard introductory question frames
         subject = re.sub(
             r'^(what is|what are|explain|define|describe|how does|can you explain)\s+',
             '',
@@ -89,23 +76,29 @@ class RagEngine:
         return subject.rstrip('?.!').strip()
 
     def _contextualize_query(self, query: str, chat_history: Optional[List[Dict[str, Any]]] = None) -> str:
-        """Resolves pronouns and bare elliptical phrases without corrupting standalone questions."""
+        """
+        Resolves pronouns and bare elliptical phrases without corrupting
+        complete, standalone questions that contain words like 'explain' or 'example'.
+        """
         if not chat_history:
             return query
 
         clean_q = query.strip()
         tokens = clean_q.split()
 
+        # CASE 1: Explicit Pronoun Anaphora ("Can you give an example of that?", "How does it work?")
         if len(tokens) <= 12 and self.pronoun_pattern.search(clean_q):
             subject = self._extract_prior_subject(chat_history, clean_q)
             if subject:
                 return self.pronoun_pattern.sub(subject, clean_q)
 
+        # CASE 2: Bare Elliptical Follow-ups ("give a concrete example", "tell me more", "why?")
         if self.bare_followup_pattern.match(clean_q):
             subject = self._extract_prior_subject(chat_history, clean_q)
             if subject:
                 return f"{clean_q.rstrip('?.!')} for {subject}"
 
+        # CASE 3: Standalone questions (e.g. "explain morphology", "what is discourse analysis")
         return query
 
     def format_grounding_context(self, chunks: List[Dict[str, Any]]) -> str:
@@ -120,7 +113,7 @@ class RagEngine:
         return "\n\n".join(context_parts)
 
     def generate_raw_context_view(self, chunks: List[Dict[str, Any]]) -> str:
-        """Formats the context blocks for the '🔍 View Grounding Chunks' expander."""
+        """Formats the context blocks for the '🔍 View Grounding Chunks' expander in app.py."""
         formatted_segments = []
         for idx, chunk in enumerate(chunks, 1):
             meta = chunk.get("metadata", {})
@@ -138,34 +131,6 @@ class RagEngine:
             )
         return "\n\n---\n\n".join(formatted_segments)
 
-    def _call_aq_api(self, user_content: str, system_instruction: str) -> str:
-        """Executes a direct POST request using the AQ key in the Authorization header."""
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent"
-        payload = {
-            "contents": [{"parts": [{"text": user_content}]}],
-            "systemInstruction": {"parts": [{"text": system_instruction}]},
-            "generationConfig": {"temperature": 0.0}
-        }
-
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-                "X-Goog-Api-Key": self.api_key
-            },
-            method="POST"
-        )
-
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            candidates = data.get("candidates", [])
-            if candidates and "content" in candidates[0]:
-                parts = candidates[0]["content"].get("parts", [])
-                return "".join([p.get("text", "") for p in parts])
-            return "Unable to parse response from model."
-
     def generate_response(
         self,
         query: str,
@@ -173,9 +138,14 @@ class RagEngine:
         top_k: int = 8,
         source_filter: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Executes retrieval, guardrail validation, and grounded generation."""
+        """
+        Executes end-to-end RAG with threshold guardrails, query contextualization,
+        and clean separation of hallucination guardrails vs upstream server errors.
+        """
+        # 1. Resolve coreference / follow-up ambiguity
         search_query = self._contextualize_query(query, chat_history)
 
+        # 2. Dense Semantic Vector Search
         try:
             retrieved_chunks = self.vector_store.search(
                 query=search_query,
@@ -200,6 +170,7 @@ class RagEngine:
                 "raw_context": ""
             }
 
+        # 3. Calculate Confidence from Top-Ranked Chunk
         top_chunk = retrieved_chunks[0]
         if "confidence_score" in top_chunk:
             confidence = round(float(top_chunk["confidence_score"]), 2)
@@ -209,7 +180,7 @@ class RagEngine:
 
         raw_context_view = self.generate_raw_context_view(retrieved_chunks)
 
-        # Grounding confidence threshold check
+        # 4. Guardrail Evaluation (Sub-60% Confidence)
         if confidence < self.guardrail_threshold:
             refusal_msg = (
                 f"I cannot provide a grounded answer. The most relevant information in the knowledge "
@@ -225,6 +196,7 @@ class RagEngine:
                 "raw_context": raw_context_view
             }
 
+        # 5. Extract Structured Sources
         sources_list = []
         seen_sources = set()
         for c in retrieved_chunks:
@@ -236,6 +208,7 @@ class RagEngine:
                 seen_sources.add(pair)
                 sources_list.append({"source": src, "page": pg})
 
+        # 6. Build Grounded Prompt using contextualized query
         context_str = self.format_grounding_context(retrieved_chunks)
         system_instruction = (
             "You are IntelliAssist AI, an objective, rigorous academic NLP assistant. "
@@ -253,42 +226,13 @@ class RagEngine:
             f"Instructions: Provide a structured, direct, focused technical answer cited directly from the context above."
         )
 
-        # Route 1: AQ Authorization Key (Primary path)
-        if self.api_key and self.api_key.startswith("AQ."):
-            try:
-                answer_text = self._call_aq_api(user_content, system_instruction)
-                return {
-                    "answer": answer_text,
-                    "confidence": confidence,
-                    "guardrail_triggered": False,
-                    "chunks": retrieved_chunks,
-                    "sources": sources_list,
-                    "raw_context": raw_context_view
-                }
-            except urllib.error.HTTPError as e:
-                err_body = e.read().decode("utf-8")
-                return {
-                    "answer": f"⚠️ **Inference API Failure**: {e.code} {err_body}",
-                    "confidence": confidence,
-                    "guardrail_triggered": False,
-                    "chunks": retrieved_chunks,
-                    "sources": sources_list,
-                    "raw_context": raw_context_view
-                }
-            except Exception as e:
-                return {
-                    "answer": f"⚠️ **Inference API Failure**: {str(e)}",
-                    "confidence": confidence,
-                    "guardrail_triggered": False,
-                    "chunks": retrieved_chunks,
-                    "sources": sources_list,
-                    "raw_context": raw_context_view
-                }
-
-        # Route 2: Standard Client SDK Fallback
+        # 7. Model Inference via Google GenAI SDK
         if not self.client:
             return {
-                "answer": "⚠️ **Configuration Error**: Gemini API key is missing or uninitialized.",
+                "answer": (
+                    "⚠️ **Configuration Error**: Gemini API client is uninitialized. "
+                    "Please check that `GEMINI_API_KEY` is present in your `.env` file."
+                ),
                 "confidence": confidence,
                 "guardrail_triggered": False,
                 "chunks": retrieved_chunks,
@@ -305,7 +249,9 @@ class RagEngine:
                     temperature=0.0
                 )
             )
+
             answer_text = response.text if response and response.text else "Unable to generate response from context."
+
             return {
                 "answer": answer_text,
                 "confidence": confidence,
@@ -314,9 +260,44 @@ class RagEngine:
                 "sources": sources_list,
                 "raw_context": raw_context_view
             }
+
         except Exception as e:
+            err_str = str(e)
+
+            # Rate limiting / Quota exhaustion
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                friendly_msg = (
+                    "⚠️ **API Quota Exceeded (429 Rate Limit)**: Daily or minute quota reached on the active key. "
+                    "Please swap to your backup key in `.env` or wait for the quota window to reset."
+                )
+                return {
+                    "answer": friendly_msg,
+                    "confidence": confidence,
+                    "guardrail_triggered": False,
+                    "chunks": retrieved_chunks,
+                    "sources": sources_list,
+                    "raw_context": raw_context_view
+                }
+
+            # Server-side overload (503) or transient API failures
+            if "503" in err_str or "UNAVAILABLE" in err_str:
+                server_msg = (
+                    "⚠️ **Upstream Model Overloaded (503 Service Unavailable)**: The Gemini inference service "
+                    "is temporarily saturated. Document retrieval succeeded, but text generation timed out. "
+                    "Please retry in a moment."
+                )
+                return {
+                    "answer": server_msg,
+                    "confidence": confidence,
+                    "guardrail_triggered": False,
+                    "chunks": retrieved_chunks,
+                    "sources": sources_list,
+                    "raw_context": raw_context_view
+                }
+
+            # Generic API / Connection Error
             return {
-                "answer": f"⚠️ **Inference API Failure**: {str(e)}",
+                "answer": f"⚠️ **Inference API Failure**: {err_str}",
                 "confidence": confidence,
                 "guardrail_triggered": False,
                 "chunks": retrieved_chunks,
