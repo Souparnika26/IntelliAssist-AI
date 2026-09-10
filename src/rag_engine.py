@@ -28,7 +28,6 @@ class RagEngine:
             confidence_threshold: Optional[float] = None
     ):
         self.vector_store = vector_store
-        # Hardcode gemini-3.6-flash to guarantee deprecation bypass
         self.model_name = "gemini-3.6-flash"
         self.model_id = "gemini-3.6-flash"
         self.guardrail_threshold = confidence_threshold if confidence_threshold is not None else guardrail_threshold
@@ -37,19 +36,26 @@ class RagEngine:
         if GENAI_AVAILABLE:
             try:
                 import streamlit as st
+                import google.auth
+                import google.auth.transport.requests
                 from google.oauth2 import service_account
 
                 if hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
                     sa_info = dict(st.secrets["gcp_service_account"])
-                    credentials = service_account.Credentials.from_service_account_info(
+                    creds = service_account.Credentials.from_service_account_info(
                         sa_info,
-                        scopes=["https://www.googleapis.com/auth/cloud-platform"]
+                        scopes=["https://www.googleapis.com/auth/generative-language"]
                     )
+                    request = google.auth.transport.requests.Request()
+                    creds.refresh(request)
+
                     self.client = genai.Client(
-                        vertexai=True,
-                        project=sa_info["project_id"],
-                        location="us-central1",
-                        credentials=credentials
+                        api_key=creds.token,
+                        http_options={
+                            "headers": {
+                                "Authorization": f"Bearer {creds.token}"
+                            }
+                        }
                     )
                 else:
                     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
@@ -67,7 +73,7 @@ class RagEngine:
             re.IGNORECASE
         )
 
-        # Bare elliptical follow-up tokens (only when no distinct new topic is introduced)
+        # Bare elliptical follow-up tokens
         self.bare_followup_pattern = re.compile(
             r'^(give\s+(a\s+|an\s+)?(concrete\s+)?example|example|elaborate|clarify|explain\s+more|tell\s+me\s+more|more\s+details|why|why\s+so|how\s+so)\??$',
             re.IGNORECASE
