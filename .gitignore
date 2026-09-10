@@ -1,0 +1,39 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# AI Agent & Assistant Caches
+.agents/
+.claude/
+
+# Secrets & Environment Variables (CRITICAL)
+.env
+.streamlit/secrets.toml
+
+# Persistent Vector Store & Storage
+storage/
+storage/**
+
+# Raw Data & Documents
+data/
+data/**
+
+# Test Archives & Temporary Test Scripts (Keep repo clean for production)
+tests_archive/
+phase*.py
+test_*.py
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# IDE & OS Specific Files
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
