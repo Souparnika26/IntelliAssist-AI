@@ -1,8 +1,7 @@
 """
 RAG Engine Module for IntelliAssist AI.
-Manages context retrieval, calibrated guardrails, pronoun/elliptical query contextualization,
-and strictly grounded generation using Google Gemini.
-Supports modern Google AI Studio AQ authorization keys via direct Bearer headers.
+Supports modern Google AI Studio AQ authorization keys via direct HTTP Bearer headers.
+Preserves context retrieval, guardrails, pronoun contextualization, and grounded generation.
 """
 
 import json
@@ -37,7 +36,7 @@ class RagEngine:
             confidence_threshold if confidence_threshold is not None else guardrail_threshold
         )
 
-        # Retrieve API key directly from environment or Streamlit Secrets
+        # 1. Retrieve API key from environment or Streamlit Secrets
         self.api_key = os.environ.get("GEMINI_API_KEY", "").strip()
         if not self.api_key:
             try:
@@ -47,8 +46,8 @@ class RagEngine:
             except Exception:
                 pass
 
+        # 2. SDK client fallback for legacy AIza keys only
         self.client = None
-        # Initialize standard client only for legacy AIza keys
         if GENAI_AVAILABLE and self.api_key and not self.api_key.startswith("AQ."):
             try:
                 self.client = genai.Client(api_key=self.api_key)
@@ -140,7 +139,7 @@ class RagEngine:
         return "\n\n---\n\n".join(formatted_segments)
 
     def _call_aq_api(self, user_content: str, system_instruction: str) -> str:
-        """Executes direct POST request using the AQ Bearer authorization key."""
+        """Executes a direct POST request using the AQ key in the Authorization header."""
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent"
         payload = {
             "contents": [{"parts": [{"text": user_content}]}],
@@ -210,6 +209,7 @@ class RagEngine:
 
         raw_context_view = self.generate_raw_context_view(retrieved_chunks)
 
+        # Grounding confidence threshold check
         if confidence < self.guardrail_threshold:
             refusal_msg = (
                 f"I cannot provide a grounded answer. The most relevant information in the knowledge "
@@ -253,7 +253,7 @@ class RagEngine:
             f"Instructions: Provide a structured, direct, focused technical answer cited directly from the context above."
         )
 
-        # 1. Primary path: AQ Bearer Key Call
+        # Route 1: AQ Authorization Key (Primary path)
         if self.api_key and self.api_key.startswith("AQ."):
             try:
                 answer_text = self._call_aq_api(user_content, system_instruction)
@@ -285,7 +285,7 @@ class RagEngine:
                     "raw_context": raw_context_view
                 }
 
-        # 2. Secondary path: Client SDK for standard API keys
+        # Route 2: Standard Client SDK Fallback
         if not self.client:
             return {
                 "answer": "⚠️ **Configuration Error**: Gemini API key is missing or uninitialized.",
