@@ -33,11 +33,22 @@ class RagEngine:
         self.model_id = "gemini-3.6-flash"
         self.guardrail_threshold = confidence_threshold if confidence_threshold is not None else guardrail_threshold
 
-        api_key = os.environ.get("GEMINI_API_KEY")
+        api_key = os.environ.get("GEMINI_API_KEY", "").strip()
         self.client = None
         if GENAI_AVAILABLE and api_key:
             try:
-                self.client = genai.Client(api_key=api_key)
+                if api_key.startswith("AQ."):
+                    self.client = genai.Client(
+                        api_key=api_key,
+                        http_options={
+                            "headers": {
+                                "Authorization": f"Bearer {api_key}",
+                                "X-Goog-Api-Key": api_key,
+                            }
+                        },
+                    )
+                else:
+                    self.client = genai.Client(api_key=api_key)
             except Exception:
                 self.client = None
 
