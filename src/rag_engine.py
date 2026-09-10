@@ -4,14 +4,16 @@ Manages context retrieval, calibrated guardrails, pronoun/elliptical query conte
 and strictly grounded generation using Google Gemini.
 """
 
+import json
 import os
 import re
-from typing import List, Dict, Any, Optional
+import urllib.error
+import urllib.request
+from typing import Any, Dict, List, Optional
 
 try:
     from google import genai
     from google.genai import types
-    from google.genai.errors import APIError
     GENAI_AVAILABLE = True
 except ImportError:
     GENAI_AVAILABLE = False
@@ -21,49 +23,59 @@ class RagEngine:
     """Core Retrieval-Augmented Generation engine aligned with app.py schema."""
 
     def __init__(
-            self,
-            vector_store: Any,
-            model_name: str = "gemini-3.6-flash",
-            guardrail_threshold: float = 60.0,
-            confidence_threshold: Optional[float] = None
+        self,
+        vector_store: Any,
+        model_name: str = "gemini-3.6-flash",
+        guardrail_threshold: float = 60.0,
+        confidence_threshold: Optional[float] = None
     ):
         self.vector_store = vector_store
+        # Hardcode gemini-3.6-flash to guarantee deprecation bypass
         self.model_name = "gemini-3.6-flash"
         self.model_id = "gemini-3.6-flash"
-        self.guardrail_threshold = confidence_threshold if confidence_threshold is not None else guardrail_threshold
+        self.guardrail_threshold = (
+            confidence_threshold if confidence_threshold is not None else guardrail_threshold
+        )
 
         self.client = None
-        if GENAI_AVAILABLE:
-            try:
-                import streamlit as st
-                import google.auth
-                import google.auth.transport.requests
-                from google.oauth2 import service_account
+        self.sa_credentials = None
 
-                if hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
-                    sa_info = dict(st.secrets["gcp_service_account"])
-                    creds = service_account.Credentials.from_service_account_info(
-                        sa_info,
-                        scopes=["https://www.googleapis.com/auth/generative-language"]
-                    )
-                    request = google.auth.transport.requests.Request()
-                    creds.refresh(request)
+        # 1. Attempt Service Account extraction from Streamlit Secrets or Environment
+        try:
+            import streamlit as st
+            from google.oauth2 import service_account
 
-                    self.client = genai.Client(
-                        api_key=creds.token,
-                        http_options={
-                            "headers": {
-                                "Authorization": f"Bearer {creds.token}"
-                            }
-                        }
-                    )
-                else:
-                    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-                    self.client = genai.Client(api_key=api_key)
-            except Exception:
-                api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+            if hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
+                sa_info = dict(st.secrets["gcp_service_account"])
+                self.sa_credentials = service_account.Credentials.from_service_account_info(
+                    sa_info,
+                    scopes=["https://www.googleapis.com/auth/generative-language"]
+                )
+            elif os.path.exists("service_account.json"):
+                self.sa_credentials = service_account.Credentials.from_service_account_file(
+                    "service_account.json",
+                    scopes=["https://www.googleapis.com/auth/generative-language"]
+                )
+        except Exception:
+            self.sa_credentials = None
+
+        # 2. Standard Client initialization fallback (for API Keys)
+        if not self.sa_credentials and GENAI_AVAILABLE:
+            api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+            if api_key:
                 try:
-                    self.client = genai.Client(api_key=api_key)
+                    if api_key.startswith("AQ."):
+                        self.client = genai.Client(
+                            api_key=api_key,
+                            http_options={
+                                "headers": {
+                                    "Authorization": f"Bearer {api_key}",
+                                    "X-Goog-Api-Key": api_key
+                                }
+                            }
+                        )
+                    else:
+                        self.client = genai.Client(api_key=api_key)
                 except Exception:
                     self.client = None
 
@@ -73,7 +85,7 @@ class RagEngine:
             re.IGNORECASE
         )
 
-        # Bare elliptical follow-up tokens
+        # Bare elliptical follow-up tokens (only when no distinct new topic is introduced)
         self.bare_followup_pattern = re.compile(
             r'^(give\s+(a\s+|an\s+)?(concrete\s+)?example|example|elaborate|clarify|explain\s+more|tell\s+me\s+more|more\s+details|why|why\s+so|how\s+so)\??$',
             re.IGNORECASE
@@ -253,12 +265,74 @@ class RagEngine:
             f"Instructions: Provide a structured, direct, focused technical answer cited directly from the context above."
         )
 
-        # 7. Model Inference via Google GenAI SDK
+        # 7. Model Inference: Branch 1 - Direct Bearer POST using Service Account Credentials
+        if self.sa_credentials:
+            try:
+                import google.auth.transport.requests
+                auth_req = google.auth.transport.requests.Request()
+                self.sa_credentials.refresh(auth_req)
+                access_token = self.sa_credentials.token
+
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent"
+                payload = {
+                    "contents": [{"parts": [{"text": user_content}]}],
+                    "systemInstruction": {"parts": [{"text": system_instruction}]},
+                    "generationConfig": {"temperature": 0.0}
+                }
+
+                req_obj = urllib.request.Request(
+                    url,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {access_token}"
+                    },
+                    method="POST"
+                )
+
+                with urllib.request.urlopen(req_obj) as resp:
+                    resp_data = json.loads(resp.read().decode("utf-8"))
+                    candidates = resp_data.get("candidates", [])
+                    if candidates and "content" in candidates[0]:
+                        parts = candidates[0]["content"].get("parts", [])
+                        answer_text = "".join([p.get("text", "") for p in parts])
+                    else:
+                        answer_text = "Unable to generate response from context."
+
+                return {
+                    "answer": answer_text,
+                    "confidence": confidence,
+                    "guardrail_triggered": False,
+                    "chunks": retrieved_chunks,
+                    "sources": sources_list,
+                    "raw_context": raw_context_view
+                }
+            except urllib.error.HTTPError as e:
+                err_body = e.read().decode("utf-8")
+                return {
+                    "answer": f"⚠️ **Inference API Failure**: {e.code} {err_body}",
+                    "confidence": confidence,
+                    "guardrail_triggered": False,
+                    "chunks": retrieved_chunks,
+                    "sources": sources_list,
+                    "raw_context": raw_context_view
+                }
+            except Exception as e:
+                return {
+                    "answer": f"⚠️ **Inference API Failure**: {str(e)}",
+                    "confidence": confidence,
+                    "guardrail_triggered": False,
+                    "chunks": retrieved_chunks,
+                    "sources": sources_list,
+                    "raw_context": raw_context_view
+                }
+
+        # Model Inference: Branch 2 - Google GenAI SDK fallback
         if not self.client:
             return {
                 "answer": (
                     "⚠️ **Configuration Error**: Gemini API client is uninitialized. "
-                    "Please check that `GEMINI_API_KEY` is present in your `.env` file."
+                    "Please verify your credentials or `GEMINI_API_KEY`."
                 ),
                 "confidence": confidence,
                 "guardrail_triggered": False,
@@ -277,7 +351,11 @@ class RagEngine:
                 )
             )
 
-            answer_text = response.text if response and response.text else "Unable to generate response from context."
+            answer_text = (
+                response.text
+                if response and response.text
+                else "Unable to generate response from context."
+            )
 
             return {
                 "answer": answer_text,
@@ -291,14 +369,12 @@ class RagEngine:
         except Exception as e:
             err_str = str(e)
 
-            # Rate limiting / Quota exhaustion
             if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                friendly_msg = (
-                    "⚠️ **API Quota Exceeded (429 Rate Limit)**: Daily or minute quota reached on the active key. "
-                    "Please swap to your backup key in `.env` or wait for the quota window to reset."
-                )
                 return {
-                    "answer": friendly_msg,
+                    "answer": (
+                        "⚠️ **API Quota Exceeded (429 Rate Limit)**: Daily or minute quota reached on the active key. "
+                        "Please swap to your backup key in `.env` or wait for the quota window to reset."
+                    ),
                     "confidence": confidence,
                     "guardrail_triggered": False,
                     "chunks": retrieved_chunks,
@@ -306,15 +382,13 @@ class RagEngine:
                     "raw_context": raw_context_view
                 }
 
-            # Server-side overload (503) or transient API failures
             if "503" in err_str or "UNAVAILABLE" in err_str:
-                server_msg = (
-                    "⚠️ **Upstream Model Overloaded (503 Service Unavailable)**: The Gemini inference service "
-                    "is temporarily saturated. Document retrieval succeeded, but text generation timed out. "
-                    "Please retry in a moment."
-                )
                 return {
-                    "answer": server_msg,
+                    "answer": (
+                        "⚠️ **Upstream Model Overloaded (503 Service Unavailable)**: The Gemini inference service "
+                        "is temporarily saturated. Document retrieval succeeded, but text generation timed out. "
+                        "Please retry in a moment."
+                    ),
                     "confidence": confidence,
                     "guardrail_triggered": False,
                     "chunks": retrieved_chunks,
@@ -322,7 +396,6 @@ class RagEngine:
                     "raw_context": raw_context_view
                 }
 
-            # Generic API / Connection Error
             return {
                 "answer": f"⚠️ **Inference API Failure**: {err_str}",
                 "confidence": confidence,
